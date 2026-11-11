@@ -1,73 +1,108 @@
-from collections.abc import Mapping
+"""Resource pool management (water, oxygen, power, fuel).
+
+All mutations are **validated before anything is applied**, so a failed action
+can never leave the player with half-spent resources.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from app.core.errors import InsufficientResourceError
+from app.core.utils import clamp
+from app.domain.catalog import Catalog
+from app.domain.state import GameState
 
 
 class ResourceManager:
-    """Manage a player's numeric resources.
+    def __init__(self, state: GameState, catalog: Catalog) -> None:
+        self.state = state
+        self.catalog = catalog
 
-    Each instance owns its own dictionary, so separate game sessions cannot
-    accidentally share resource values.
-    """
+    # -- reads --------------------------------------------------------------
+    def get(self, name: str) -> int:
+        return int(self.state.resources.get(name, 0))
 
-    DEFAULT_RESOURCES = {
-        "water": 100,
-        "oxygen": 80,
-        "power": 60,
-    }
+    def cap(self, name: str) -> int:
+        return int(self.state.resource_caps.get(name, self.catalog.resources[name].cap))
 
-    def __init__(self, initial_resources: Mapping[str, int] | None = None):
-        source = self.DEFAULT_RESOURCES if initial_resources is None else initial_resources
-        if not isinstance(source, Mapping):
-            raise TypeError("Initial resources must be a mapping")
+    def all(self) -> dict[str, int]:
+        return dict(self.state.resources)
 
-        self._resources: dict[str, int] = dict(source)
+    def ratio(self, name: str) -> float:
+        cap = self.cap(name)
+        return self.get(name) / cap if cap else 0.0
 
-        for name, amount in self._resources.items():
-            self._validate_name(name)
-            self._validate_initial_amount(amount, name)
+    def critical(self) -> list[str]:
+        return [
+            rid
+            for rid, definition in self.catalog.resources.items()
+            if self.get(rid) <= definition.critical_below
+        ]
 
-    @staticmethod
-    def _validate_name(name: str) -> None:
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("Resource name must be a non-empty string")
+    # -- validation ---------------------------------------------------------
+    def shortfalls(self, deltas: dict[str, int]) -> list[dict[str, Any]]:
+        """Return every resource that cannot cover the requested spend."""
+        problems: list[dict[str, Any]] = []
+        for name, delta in deltas.items():
+            if name not in self.catalog.resources:
+                problems.append({"resource": name, "reason": "unknown_resource"})
+                continue
+            if delta < 0 and self.get(name) < -delta:
+                problems.append(
+                    {
+                        "resource": name,
+                        "required": -delta,
+                        "available": self.get(name),
+                        "reason": "insufficient",
+                    }
+                )
+        return problems
 
-    @staticmethod
-    def _validate_initial_amount(amount: int, name: str) -> None:
-        if type(amount) is not int or amount < 0:
-            raise ValueError(f"Initial amount for '{name}' must be a non-negative integer")
+    def validate(self, deltas: dict[str, int]) -> None:
+        problems = self.shortfalls(deltas)
+        if problems:
+            first = problems[0]
+            raise InsufficientResourceError(
+                f"Not enough {first['resource']}: needs {first.get('required', '?')}, "
+                f"has {first.get('available', 0)}.",
+                shortfalls=problems,
+            )
 
-    @staticmethod
-    def _validate_amount(amount: int) -> None:
-        if type(amount) is not int or amount <= 0:
-            raise ValueError("Amount must be a positive integer")
-
-    def get_resource(self, name: str) -> int:
-        self._validate_name(name)
-        if name not in self._resources:
-            raise KeyError(f"Unknown resource: {name}")
-        return self._resources[name]
-
-    def get_all(self) -> dict[str, int]:
-        return self._resources.copy()
+    # -- writes -------------------------------------------------------------
+    def apply(self, deltas: dict[str, int]) -> list[dict[str, Any]]:
+        """Atomically apply resource deltas. Positive values clamp at the cap."""
+        self.validate(deltas)
+        changes: list[dict[str, Any]] = []
+        for name, delta in deltas.items():
+            if delta == 0:
+                continue
+            before = self.get(name)
+            after = clamp(before + delta, 0, self.cap(name))
+            self.state.resources[name] = after
+            effective = after - before
+            if effective < 0:
+                bucket = self.state.stats.resources_consumed
+                bucket[name] = bucket.get(name, 0) + (-effective)
+            elif effective > 0:
+                bucket = self.state.stats.resources_recovered
+                bucket[name] = bucket.get(name, 0) + effective
+            changes.append(
+                {"resource": name, "before": before, "after": after, "delta": effective}
+            )
+        return changes
 
     def consume(self, name: str, amount: int) -> int:
-        self._validate_name(name)
-        self._validate_amount(amount)
-        if name not in self._resources:
-            raise KeyError(f"Unknown resource: {name}")
-        if self._resources[name] < amount:
-            raise ValueError(f"Not enough {name}")
-
-        self._resources[name] -= amount
-        return self._resources[name]
+        if amount <= 0:
+            raise ValueError("Consumed amount must be positive")
+        self.apply({name: -amount})
+        return self.get(name)
 
     def add(self, name: str, amount: int) -> int:
-        self._validate_name(name)
-        self._validate_amount(amount)
-        if name not in self._resources:
-            raise KeyError(f"Unknown resource: {name}")
+        if amount <= 0:
+            raise ValueError("Added amount must be positive")
+        self.apply({name: amount})
+        return self.get(name)
 
-        self._resources[name] += amount
-        return self._resources[name]
-
-    def to_dict(self) -> dict[str, int]:
-        return self.get_all()
+    def refill(self, name: str) -> int:
+        return self.add(name, max(0, self.cap(name) - self.get(name)))
